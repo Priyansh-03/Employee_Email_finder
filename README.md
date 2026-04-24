@@ -47,29 +47,35 @@ Licensed under the **Apache License, Version 2.0**. See [`LICENSE`](LICENSE).
 
 ## Publishing this repository to GitHub
 
-SSH push works once the empty repository exists on GitHub.
+This tree is already initialized as a `git` repository with an initial commit. Use SSH to push after the empty GitHub repository exists.
 
-**Option A — GitHub web UI**
+**Suggested “About” description (paste into GitHub):**
 
-1. Create a new public repository named `employee-email-finder` (no README, no `.gitignore`, no license—keep it empty to avoid merge conflicts).
-2. From this project directory:
+> Resolve employer domains from a company name, generate common corporate email patterns, and check deliverability via DNS MX and SMTP `RCPT TO` without sending message bodies. Includes a Chrome extension backed by a local Flask API.
+
+**Option A — create an empty repo in the browser, then push**
+
+1. On GitHub: **New repository** → name `employee-email-finder` → public → do **not** add README, `.gitignore`, or license (avoids merge conflicts).
+2. In this folder:
 
 ```bash
-git init
-git branch -M main
-git add .
-git commit -m "Initial commit: Employee Email Finder"
+git remote remove origin 2>/dev/null || true
 git remote add origin git@github.com:Priyansh-03/employee-email-finder.git
 git push -u origin main
 ```
 
-**Option B — API with a token**
+Change `Priyansh-03` if your account or organization name differs.
+
+**Option B — create the repo with the REST API, then push**
+
+Requires a [personal access token](https://github.com/settings/tokens) with permission to create repositories.
 
 ```bash
-export GH_TOKEN='your_github_pat_with_repo_scope'
+export GH_TOKEN='your_token_here'
 ./scripts/create_github_repo.sh
-git remote add origin git@github.com:Priyansh-03/employee-email-finder.git   # if not already set
+git remote remove origin 2>/dev/null || true
+git remote add origin git@github.com:Priyansh-03/employee-email-finder.git
 git push -u origin main
 ```
 
-Set `GITHUB_OWNER` if the owner is not `Priyansh-03`.
+Optional environment variables: `GITHUB_OWNER` (for the clone URL printed in the script message), `GITHUB_REPO`, `GITHUB_REPO_DESCRIPTION`.
