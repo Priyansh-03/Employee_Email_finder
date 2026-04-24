@@ -2,7 +2,7 @@
 # Create the GitHub repository via REST API (requires GH_TOKEN with repo scope).
 set -euo pipefail
 
-export GITHUB_REPO="${GITHUB_REPO:-employee-email-finder}"
+export GITHUB_REPO="${GITHUB_REPO:-Employee_Email_finder}"
 export GITHUB_REPO_DESCRIPTION="${GITHUB_REPO_DESCRIPTION:-Employee Email Finder: domain resolution, email permutations, MX/SMTP validation without sending mail; Chrome extension + local Flask backend.}"
 OWNER="${GITHUB_OWNER:-Priyansh-03}"
 

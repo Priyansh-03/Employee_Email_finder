@@ -55,12 +55,12 @@ This tree is already initialized as a `git` repository with an initial commit. U
 
 **Option A — create an empty repo in the browser, then push**
 
-1. On GitHub: **New repository** → name `employee-email-finder` → public → do **not** add README, `.gitignore`, or license (avoids merge conflicts).
+1. On GitHub: **New repository** → name `Employee_Email_finder` (or your chosen name) → public → do **not** add README, `.gitignore`, or license (avoids merge conflicts).
 2. In this folder:
 
 ```bash
 git remote remove origin 2>/dev/null || true
-git remote add origin git@github.com:Priyansh-03/employee-email-finder.git
+git remote add origin git@github.com:Priyansh-03/Employee_Email_finder.git
 git push -u origin main
 ```
 
@@ -74,8 +74,10 @@ Requires a [personal access token](https://github.com/settings/tokens) with perm
 export GH_TOKEN='your_token_here'
 ./scripts/create_github_repo.sh
 git remote remove origin 2>/dev/null || true
-git remote add origin git@github.com:Priyansh-03/employee-email-finder.git
+git remote add origin git@github.com:Priyansh-03/Employee_Email_finder.git
 git push -u origin main
 ```
 
-Optional environment variables: `GITHUB_OWNER` (for the clone URL printed in the script message), `GITHUB_REPO`, `GITHUB_REPO_DESCRIPTION`.
+Optional environment variables: `GITHUB_OWNER` (for the clone URL printed in the script message), `GITHUB_REPO` (must match the GitHub repo name, e.g. `Employee_Email_finder`), `GITHUB_REPO_DESCRIPTION`.
+
+**Upstream repository:** [github.com/Priyansh-03/Employee_Email_finder](https://github.com/Priyansh-03/Employee_Email_finder)
