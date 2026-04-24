@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Employee Email Finder",
+  "version": "1.0",
+  "description": "Discover likely corporate email addresses via domain lookup and SMTP checks (local backend required).",
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "activeTab",
+    "storage"
+  ]
+}
