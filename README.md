@@ -47,6 +47,8 @@ python email_finder.py given-name family-name "Company Legal Name Inc"
 
 If the tool cannot infer a website domain from the company name, it will ask you to type one (such as `example.com`).
 
+Successful lookups append a small local record under `learned_patterns.json` (pattern id and mail host only, not full addresses) so later searches can try known-good domains first.
+
 ## Responsible use
 
 Only use this where you are allowed to (law, contract, and company policy). Do not use it to harass people or to break rules on unsolicited contact.

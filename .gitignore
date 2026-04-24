@@ -21,6 +21,9 @@ build/
 .DS_Store
 Thumbs.db
 
+# Learned successful patterns (local only; not committed)
+learned_patterns.json
+
 # Flask / local
 instance/
 .webassets-cache

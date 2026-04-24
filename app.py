@@ -8,7 +8,7 @@ import queue
 import threading
 
 # Import the existing logic from our script
-from email_finder import find_company_domains, generate_domain_variations, find_email
+from email_finder import two_pass_find_email
 
 app = Flask(__name__)
 CORS(app) # Allow requests from the Chrome extension
@@ -24,23 +24,13 @@ def api_find_email():
         return jsonify({"success": False, "message": "Missing required fields"}), 400
         
     print(f"\n[API] Received request for: {first_name} {last_name} @ {company}")
-    
-    # 1. Find the correct domain for the company
-    target_domains = find_company_domains(company)
-    
-    # 2. If no domain was found via Clearbit, fallback to a basic guess
-    if not target_domains:
-        guessed_domain = f"{company.lower().replace(' ', '')}.com"
-        print(f"[API] No domain found automatically. Guessing: {guessed_domain}")
-        target_domains = [guessed_domain]
-        
-    # 3. Generate common TLD variations (e.g., .com -> .co, .in, etc.)
-    target_domains = generate_domain_variations(target_domains)
-        
-    print(f"[API] Starting email search using domains: {target_domains}")
-    
-    # 4. Search for the email using our existing function
-    email = find_email(first_name, last_name, target_domains)
+
+    def api_progress(msg, _current_email=None):
+        print(msg)
+
+    email = two_pass_find_email(
+        first_name, last_name, company, progress_callback=api_progress
+    )
     
     if email:
         print(f"[API] Success! Returning email: {email}")
@@ -82,30 +72,14 @@ def stream_find_email():
             try:
                 if cancel_event.is_set():
                     return
-                    
-                q.put({"type": "progress", "message": f"[*] Searching for official domain for company: '{company}'..."})
-                # 1. Find the correct domain for the company
-                target_domains = find_company_domains(company)
-                
-                if cancel_event.is_set():
-                    return
-                    
-                # 2. If no domain was found via Clearbit, fallback to a basic guess
-                if not target_domains:
-                    guessed_domain = f"{company.lower().replace(' ', '')}.com"
-                    q.put({"type": "progress", "message": f"[API] No domain found automatically. Guessing: {guessed_domain}"})
-                    target_domains = [guessed_domain]
-                    
-                # 3. Generate common TLD variations (e.g., .com -> .co, .in, etc.)
-                target_domains = generate_domain_variations(target_domains)
-                    
-                q.put({"type": "progress", "message": f"[*] Starting email search using domains: {target_domains}"})
-                
-                if cancel_event.is_set():
-                    return
-                    
-                # 4. Search for the email using our existing function
-                email = find_email(first_name, last_name, target_domains, progress_callback, cancel_event)
+
+                email = two_pass_find_email(
+                    first_name,
+                    last_name,
+                    company,
+                    progress_callback,
+                    cancel_event,
+                )
                 
                 if cancel_event.is_set():
                     q.put({"type": "result", "success": False, "message": "Search stopped by user.", "cancelled": True})

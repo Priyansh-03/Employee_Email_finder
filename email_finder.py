@@ -9,9 +9,37 @@ import requests
 import argparse
 import sys
 import re
+import os
+import json
+import tempfile
 import concurrent.futures
 import threading
+from datetime import datetime, timezone
 from urllib.parse import quote
+
+# Must stay in lockstep with `generate_permutations` (same length and order).
+PERMUTATION_PATTERN_KEYS = (
+    "first_dot_last",
+    "first_last",
+    "first_underscore_last",
+    "first_hyphen_last",
+    "last_dot_first",
+    "last_first",
+    "first_only",
+    "last_only",
+    "f_initial_last",
+    "f_dot_last",
+    "f_underscore_last",
+    "first_l_initial",
+    "first_dot_l_initial",
+    "first_underscore_l_initial",
+    "last_f_initial",
+    "last_dot_f_initial",
+    "l_initial_first",
+    "l_dot_first",
+)
+
+_learned_io_lock = threading.Lock()
 
 def clean_company_name(name):
     """Remove common corporate suffixes to improve API search results."""
@@ -206,7 +234,298 @@ def generate_domain_variations(domains):
     others = [d for d in variations if not d.endswith('.com')]
     return coms + others
 
-def find_email(first_name, last_name, domains, progress_callback=None, cancel_event=None):
+
+def company_slug_from_first_domain(domains):
+    """Leftmost label of the first domain (stable brand key)."""
+    if not domains:
+        return None
+    first = domains[0].strip()
+    if not first or "." not in first:
+        return None
+    return first.split(".")[0].lower()
+
+
+def normalized_company_match_key(company_name):
+    """Alphanumeric brand key for matching company input to learned JSON slugs."""
+    c = clean_company_name(company_name or "")
+    return re.sub(r"[^a-z0-9]", "", c.lower())
+
+
+def match_learned_slug(company_name, store):
+    """
+    Pick a learned JSON key (slug) for this company name, if any.
+    Prefers longest slug where slug.startswith(norm); else longest where norm.startswith(slug).
+    """
+    norm = normalized_company_match_key(company_name)
+    if not norm or not isinstance(store, dict) or not store:
+        return None
+    best = None
+    best_len = -1
+    for slug in store:
+        if not isinstance(slug, str):
+            continue
+        s = slug.lower()
+        if s.startswith(norm) and len(s) > best_len:
+            best_len = len(s)
+            best = slug
+    if best:
+        return best
+    best = None
+    best_len = -1
+    for slug in store:
+        if not isinstance(slug, str):
+            continue
+        s = slug.lower()
+        if len(s) >= 3 and norm.startswith(s) and len(s) > best_len:
+            best_len = len(s)
+            best = slug
+    return best
+
+
+def learned_domains_for_slug(store, slug):
+    """Unique hostnames from successes for slug, newest rows first."""
+    if not slug:
+        return []
+    sucs = normalized_successes_for_slug(store, slug)
+    out = []
+    seen = set()
+    for s in sorted(
+        sucs, key=lambda x: x.get("updated_at") or "", reverse=True
+    ):
+        d = (s.get("domain") or "").strip()
+        if not d:
+            continue
+        low = d.lower()
+        if low not in seen:
+            seen.add(low)
+            out.append(d)
+    return out
+
+
+def merge_domain_lists_learned_first(learned_doms, other_doms):
+    """Dedupe case-insensitively; `learned_doms` order preserved, then others."""
+    seen = set()
+    out = []
+    for d in learned_doms or []:
+        d = (d or "").strip()
+        low = d.lower()
+        if low and low not in seen:
+            seen.add(low)
+            out.append(d)
+    for d in other_doms or []:
+        d = (d or "").strip()
+        low = d.lower()
+        if low and low not in seen:
+            seen.add(low)
+            out.append(d)
+    return out
+
+
+def learned_patterns_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "learned_patterns.json")
+
+
+def load_learned_patterns():
+    path = learned_patterns_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_learned_patterns(store):
+    path = learned_patterns_path()
+    directory = os.path.dirname(path)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix="learned_patterns.", suffix=".tmp", dir=directory or "."
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(store, f, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def normalized_successes_for_slug(store, slug):
+    """Return a list of success dicts for slug (supports legacy single-host shape)."""
+    if not slug:
+        return []
+    row = store.get(slug)
+    if not isinstance(row, dict):
+        return []
+    if isinstance(row.get("successes"), list):
+        return [dict(s) for s in row["successes"] if isinstance(s, dict)]
+    if row.get("preferred_domain"):
+        return [
+            {
+                "domain": row["preferred_domain"],
+                "pattern_key": row.get("pattern_key") or "unknown",
+                "updated_at": row.get("updated_at", ""),
+            }
+        ]
+    return []
+
+
+def upsert_learned_success(slug, domain_host, pattern_key):
+    """Append new (domain, pattern_key) rows; same pair only bumps updated_at."""
+    if not slug or not domain_host or not pattern_key:
+        return
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _learned_io_lock:
+        store = load_learned_patterns()
+        successes = normalized_successes_for_slug(store, slug)
+        dlow = domain_host.lower()
+        updated = False
+        for s in successes:
+            if (s.get("domain") or "").lower() == dlow and s.get("pattern_key") == pattern_key:
+                s["updated_at"] = now
+                updated = True
+                break
+        if not updated:
+            successes.append(
+                {"domain": domain_host, "pattern_key": pattern_key, "updated_at": now}
+            )
+        # Optional future cap: trim oldest rows if len(successes) exceeds N.
+        store[slug] = {"successes": successes}
+        save_learned_patterns(store)
+
+
+def infer_pattern_key(first_name, last_name, local_part):
+    if not local_part:
+        return None
+    target = local_part.strip().lower()
+    keys = PERMUTATION_PATTERN_KEYS
+    for key, email in zip(keys, generate_permutations(first_name, last_name, "x.com")):
+        if email.split("@")[0].lower() == target:
+            return key
+    return None
+
+
+def learned_pattern_keys_for_domain(successes, domain):
+    """
+    Distinct pattern_key values for this host, newest row first (case-insensitive domain).
+    """
+    dlow = domain.lower()
+    keys_allowed = PERMUTATION_PATTERN_KEYS
+    out = []
+    seen = set()
+    for s in sorted(
+        successes, key=lambda x: x.get("updated_at") or "", reverse=True
+    ):
+        if (s.get("domain") or "").lower() != dlow:
+            continue
+        pk = s.get("pattern_key")
+        if not pk or pk not in keys_allowed or pk in seen:
+            continue
+        seen.add(pk)
+        out.append(pk)
+    return out
+
+
+def ordered_local_parts_with_preferred_keys(first_name, last_name, preferred_keys):
+    """
+    All permutation local-parts; those matching preferred_keys (in order) first,
+    then the rest without duplicate local-part strings.
+    """
+    keys = PERMUTATION_PATTERN_KEYS
+    template_emails = generate_permutations(first_name, last_name, "x.com")
+    local_parts = [e.split("@")[0] for e in template_emails]
+    preferred_keys = preferred_keys or []
+    seen_lp = set()
+    ordered = []
+    for pk in preferred_keys:
+        if pk not in keys:
+            continue
+        lp = local_parts[keys.index(pk)]
+        low = lp.lower()
+        if low not in seen_lp:
+            seen_lp.add(low)
+            ordered.append(lp)
+    for lp in local_parts:
+        low = lp.lower()
+        if low not in seen_lp:
+            seen_lp.add(low)
+            ordered.append(lp)
+    return ordered
+
+
+def local_part_for_pattern_key(first_name, last_name, pattern_key):
+    keys = PERMUTATION_PATTERN_KEYS
+    if not pattern_key or pattern_key not in keys:
+        return None
+    idx = keys.index(pattern_key)
+    email = generate_permutations(first_name, last_name, "x.com")[idx]
+    return email.split("@")[0]
+
+
+def company_wide_learned_pattern_keys(successes, valid_domains):
+    """
+    Distinct pattern keys to probe on every host in Phase 0 (newest rows first).
+    Prefers keys from successes whose domain is still in valid_domains, then any other.
+    """
+    if not successes or not valid_domains:
+        return []
+    keys_allowed = PERMUTATION_PATTERN_KEYS
+    vlow = {d.lower() for d in valid_domains}
+    ordered = []
+    seen = set()
+    for s in sorted(
+        successes, key=lambda x: x.get("updated_at") or "", reverse=True
+    ):
+        pk = s.get("pattern_key")
+        if not pk or pk not in keys_allowed or pk in seen:
+            continue
+        dom = (s.get("domain") or "").strip()
+        if dom and dom.lower() in vlow:
+            seen.add(pk)
+            ordered.append(pk)
+    for s in sorted(
+        successes, key=lambda x: x.get("updated_at") or "", reverse=True
+    ):
+        pk = s.get("pattern_key")
+        if not pk or pk not in keys_allowed or pk in seen:
+            continue
+        if (s.get("domain") or "").strip():
+            seen.add(pk)
+            ordered.append(pk)
+    return ordered
+
+
+def learned_domains_phase1(valid_domains, successes):
+    """Hosts we have learned, intersected with valid_domains; newest updated_at first."""
+    by_lower = {d.lower(): d for d in valid_domains}
+    ordered = []
+    seen_lower = set()
+    for s in sorted(
+        successes, key=lambda x: x.get("updated_at") or "", reverse=True
+    ):
+        dom = (s.get("domain") or "").strip()
+        if not dom:
+            continue
+        low = dom.lower()
+        if low in by_lower and low not in seen_lower:
+            ordered.append(by_lower[low])
+            seen_lower.add(low)
+    return ordered, seen_lower
+
+
+def find_email(
+    first_name,
+    last_name,
+    domains,
+    progress_callback=None,
+    cancel_event=None,
+    company_slug=None,
+):
     """Main function to find the valid email across multiple domains with safe parallelism."""
     
     def notify(msg, current_email=None):
@@ -255,50 +574,155 @@ def find_email(first_name, last_name, domains, progress_callback=None, cancel_ev
         return None
         
     notify(f"\n[*] Proceeding with {len(valid_domains)} valid domains.")
-    
-    base_permutations = generate_permutations(first_name, last_name, "example.com")
-    
-    # Build a flat list of tasks. Since valid_domains has .com first,
-    # the queue naturally explores .com domain deeply first.
-    tasks = []
-    for domain in valid_domains:
-        for base_email in base_permutations:
-            local_part = base_email.split('@')[0]
-            tasks.append((f"{local_part}@{domain}", domain_info[domain]['mx_record'], domain))
-            
-    total_tasks = len(tasks)
-    tasks_left = total_tasks
-    notify(f"\n[*] Generated {total_tasks} possible email combinations to test.")
-    
+
+    slug = company_slug or company_slug_from_first_domain(domains)
+    learned_store = load_learned_patterns() if slug else {}
+    successes = normalized_successes_for_slug(learned_store, slug) if slug else []
+    phase1_domains, phase1_lower = learned_domains_phase1(valid_domains, successes)
+
+    def build_tasks(
+        domain_subset,
+        use_learned_pattern_order=False,
+        skip_email_lower=None,
+    ):
+        skip = skip_email_lower or set()
+        out = []
+        for domain in domain_subset:
+            pref_keys = (
+                learned_pattern_keys_for_domain(successes, domain)
+                if use_learned_pattern_order
+                else []
+            )
+            for local_part in ordered_local_parts_with_preferred_keys(
+                first_name, last_name, pref_keys
+            ):
+                email = f"{local_part}@{domain}"
+                if email.lower() in skip:
+                    continue
+                out.append(
+                    (email, domain_info[domain]["mx_record"], domain)
+                )
+        return out
+
+    company_patterns = (
+        company_wide_learned_pattern_keys(successes, valid_domains)
+        if successes
+        else []
+    )
+    skip_email_lower = set()
+    phase0_tasks = []
+    if company_patterns:
+        if phase1_domains:
+            domain_shoot_order = phase1_domains + [
+                d for d in valid_domains if d.lower() not in phase1_lower
+            ]
+        else:
+            domain_shoot_order = list(valid_domains)
+        for pk in company_patterns:
+            lp = local_part_for_pattern_key(first_name, last_name, pk)
+            if not lp:
+                continue
+            for domain in domain_shoot_order:
+                em = f"{lp}@{domain}"
+                low = em.lower()
+                if low in skip_email_lower:
+                    continue
+                skip_email_lower.add(low)
+                phase0_tasks.append(
+                    (em, domain_info[domain]["mx_record"], domain)
+                )
+
+    task_batches = []
+    if phase0_tasks:
+        keys_display = ", ".join(company_patterns)
+        task_batches.append(
+            (
+                f"Phase 0 (learned patterns [{keys_display}] on each host)",
+                phase0_tasks,
+            )
+        )
+        notify(
+            f"\n[*] Learned pattern(s) [{keys_display}] on each valid host first "
+            f"({len(phase0_tasks)} probe(s)), then full search."
+        )
+
+    if phase1_domains:
+        phase2_domains = [
+            d for d in valid_domains if d.lower() not in phase1_lower
+        ]
+        task_batches.extend(
+            [
+                (
+                    "Phase 1 (learned hosts, saved pattern first)",
+                    build_tasks(
+                        phase1_domains,
+                        use_learned_pattern_order=True,
+                        skip_email_lower=skip_email_lower,
+                    ),
+                ),
+                (
+                    "Phase 2 (other domains)",
+                    build_tasks(
+                        phase2_domains,
+                        False,
+                        skip_email_lower=skip_email_lower,
+                    ),
+                ),
+            ]
+        )
+        notify(
+            f"\n[*] Learned hosts in this run: {', '.join(phase1_domains)} "
+            f"— saved local-part pattern tried first on each, then {len(phase2_domains)} other domain(s)."
+        )
+        hints = []
+        for d in phase1_domains:
+            pks = learned_pattern_keys_for_domain(successes, d)
+            if pks:
+                hints.append(f"{d} → {', '.join(pks)}")
+        if hints:
+            notify("[*] Learned pattern order: " + "; ".join(hints))
+    else:
+        task_batches.append(
+            (
+                "Search",
+                build_tasks(
+                    valid_domains,
+                    False,
+                    skip_email_lower=skip_email_lower,
+                ),
+            )
+        )
+
     found_email = None
     stop_event = threading.Event()
     lock = threading.Lock()
-    
+    tasks_left = 0
+
     def check_email_worker(task):
         nonlocal found_email, tasks_left
         email, mx_record, domain = task
-        
+
         if stop_event.is_set() or (cancel_event and cancel_event.is_set()):
             return
-            
+
         with lock:
             current_left = tasks_left
             tasks_left -= 1
-            
+
         notify(f"[{current_left} left] Testing: {email}...", current_email=email)
-        
-        # Safe Parallelism: Add a slight random jitter (0.1s - 0.5s) before connecting
-        # so 5 threads don't hit the exact same millisecond and trigger DDoS bans.
+
         time.sleep(random.uniform(0.1, 0.5))
-        
+
         if stop_event.is_set() or (cancel_event and cancel_event.is_set()):
             return
-            
+
         is_valid = verify_email_smtp(email, mx_record, domain)
-        
+
         if is_valid is True:
             with lock:
-                if not stop_event.is_set() and not (cancel_event and cancel_event.is_set()):
+                if not stop_event.is_set() and not (
+                    cancel_event and cancel_event.is_set()
+                ):
                     found_email = email
                     stop_event.set()
                     notify("VALID! \u2705")
@@ -307,28 +731,157 @@ def find_email(first_name, last_name, domains, progress_callback=None, cancel_ev
             notify("Blocked \u26d4")
         else:
             notify("Invalid \u274c")
-            # Be polite to the server
             time.sleep(random.uniform(0.5, 1.5))
 
-    # Run 5 processes in parallel.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(check_email_worker, task) for task in tasks]
-        
-        for future in concurrent.futures.as_completed(futures):
-            if stop_event.is_set() or (cancel_event and cancel_event.is_set()):
-                # Cancel remaining tasks in the queue
-                for f in futures:
-                    f.cancel()
-                break
-                
+    def run_batch(label, tasks):
+        nonlocal tasks_left, found_email
+        if not tasks:
+            return
+        tasks_left = len(tasks)
+        notify(f"\n[*] {label}: {len(tasks)} combination(s) to test.")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(check_email_worker, t) for t in tasks]
+            for _ in concurrent.futures.as_completed(futures):
+                if stop_event.is_set() or (cancel_event and cancel_event.is_set()):
+                    for f in futures:
+                        f.cancel()
+                    break
+
+    for label, batch in task_batches:
+        if cancel_event and cancel_event.is_set():
+            break
+        if found_email:
+            break
+        run_batch(label, batch)
+
     if cancel_event and cancel_event.is_set():
         notify("\n[-] Search cancelled by user.")
         return None
-        
+
+    if found_email and slug:
+        lp = found_email.split("@")[0]
+        dom = found_email.split("@")[1]
+        pk = infer_pattern_key(first_name, last_name, lp)
+        if pk:
+            upsert_learned_success(slug, dom, pk)
+
     if not found_email:
         notify("\n[-] Could not find a valid email address.")
-        
+
     return found_email
+
+
+def _phase_progress(progress_callback, message):
+    if progress_callback:
+        progress_callback(message, None)
+    else:
+        print(message)
+
+
+def two_pass_find_email(
+    first_name,
+    last_name,
+    company,
+    progress_callback=None,
+    cancel_event=None,
+    pass2_empty_resolver=None,
+):
+    """
+    Pass 1: if learned_patterns matches the company, search using TLD variations
+    built only from stored hosts (no Clearbit yet). Pass 2: if no email, run
+    Clearbit, merge learned hosts first, expand TLDs, search again.
+    """
+    store = load_learned_patterns()
+    learned_slug = match_learned_slug(company, store)
+    learned_hosts = (
+        learned_domains_for_slug(store, learned_slug) if learned_slug else []
+    )
+    if learned_slug and not learned_hosts:
+        learned_slug = None
+
+    def cancelled():
+        return cancel_event and cancel_event.is_set()
+
+    _phase_progress(
+        progress_callback,
+        "[*] Checking learned_patterns.json for this company…",
+    )
+
+    if learned_hosts:
+        _phase_progress(
+            progress_callback,
+            (
+                f"[*] Pass 1 — matched learned key '{learned_slug}'; "
+                f"searching using saved hosts only: {', '.join(learned_hosts)}"
+            ),
+        )
+        pass1_domains = generate_domain_variations(learned_hosts)
+        _phase_progress(
+            progress_callback,
+            f"[*] Pass 1 — candidate domains: {pass1_domains}",
+        )
+        if cancelled():
+            return None
+        email = find_email(
+            first_name,
+            last_name,
+            pass1_domains,
+            progress_callback,
+            cancel_event,
+            company_slug=learned_slug,
+        )
+        if email:
+            return email
+        if cancelled():
+            return None
+        _phase_progress(
+            progress_callback,
+            "[*] Pass 1 found no email; running Clearbit and full domain search (pass 2).",
+        )
+    else:
+        _phase_progress(
+            progress_callback,
+            "[*] No learned slug match; using Clearbit and full domain list (pass 2 only).",
+        )
+
+    if cancelled():
+        return None
+
+    _phase_progress(
+        progress_callback,
+        f"[*] Pass 2 — fetching domain suggestions for '{company}'…",
+    )
+    clearbit = find_company_domains(company)
+    target_domains = merge_domain_lists_learned_first(learned_hosts, clearbit)
+
+    if not target_domains:
+        if pass2_empty_resolver:
+            target_domains = pass2_empty_resolver(company, learned_hosts) or []
+        if not target_domains:
+            guessed_domain = f"{company.lower().replace(' ', '')}.com"
+            _phase_progress(
+                progress_callback,
+                f"[API] No domain found automatically. Guessing: {guessed_domain}",
+            )
+            target_domains = [guessed_domain]
+
+    company_slug = learned_slug or company_slug_from_first_domain(target_domains)
+    target_domains = generate_domain_variations(target_domains)
+    _phase_progress(
+        progress_callback,
+        f"[*] Pass 2 — starting email search using domains: {target_domains}",
+    )
+    if cancelled():
+        return None
+    return find_email(
+        first_name,
+        last_name,
+        target_domains,
+        progress_callback,
+        cancel_event,
+        company_slug=company_slug,
+    )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find a person's corporate email address.")
@@ -341,23 +894,24 @@ if __name__ == "__main__":
     target_first = args.first_name
     target_last = args.last_name
     company_name = args.company
-    
-    # 1. First, automatically find the correct domain for the company
-    target_domains = find_company_domains(company_name)
-    
-    # 2. If no domain was found, fallback to manual domains
-    if not target_domains:
+
+    def cli_pass2_empty(company, learned_hosts):
         print("[-] Could not automatically determine the company domain.")
-        domain_input = input("Please enter the primary domain manually (e.g., company.com): ")
+        domain_input = input(
+            "Please enter the primary domain manually (e.g., company.com): "
+        )
         if not domain_input:
             print("[-] No domain provided. Exiting.")
             sys.exit(1)
-        target_domains = [domain_input]
-        
-    # 3. Generate common TLD variations (e.g., .com -> .co, .in, etc.)
-    target_domains = generate_domain_variations(target_domains)
-        
-    print(f"\n[*] Starting email search using domains: {target_domains}\n")
-    
-    # 4. Search for the email
-    find_email(target_first, target_last, target_domains)
+        return merge_domain_lists_learned_first(
+            learned_hosts, [domain_input.strip()]
+        )
+
+    email = two_pass_find_email(
+        target_first,
+        target_last,
+        company_name,
+        pass2_empty_resolver=cli_pass2_empty,
+    )
+    if not email:
+        print("\n[-] Could not find a valid email address.")
