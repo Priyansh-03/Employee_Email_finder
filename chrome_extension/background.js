@@ -78,9 +78,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (rawMsg) {
           // Determine log class based on content
           let logClass = 'log-entry';
-          if (rawMsg.includes('Invalid') || rawMsg.includes('[-]')) logClass += ' log-error';
-          else if (rawMsg.includes('VALID') || rawMsg.includes('[+]')) logClass += ' log-success';
-          else if (rawMsg.includes('[!]') || rawMsg.includes('Sleeping')) logClass += ' log-warning';
+          if (rawMsg === 'no' || rawMsg.includes('Invalid') || rawMsg.includes('[-]')
+              || rawMsg.includes('blocked') || rawMsg.startsWith('No ')
+              || rawMsg.includes('Stopped')) logClass += ' log-error';
+          else if (rawMsg === 'match' || rawMsg.startsWith('Found:')
+              || rawMsg.includes('VALID') || rawMsg.includes('Domains found:')) logClass += ' log-success';
+          else if (rawMsg.includes('[!]') || rawMsg.includes('Sleeping') || rawMsg.includes('skip ')) logClass += ' log-warning';
           
           appState.logs.push({ text: rawMsg.replace(/\[\/?(API|\*|\+|-)\]/g, '').trim(), class: logClass });
           if (appState.logs.length > 100) appState.logs.shift(); // Keep last 100 logs
@@ -95,7 +98,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           appState.resultHtml = `<strong>✨ Found!</strong><br><br><span style="font-size:16px; font-weight:bold;">${data.email}</span>`;
           appState.resultClass = 'success';
         } else {
-          appState.resultHtml = data.message || 'Could not find a valid email.';
+          appState.resultHtml = data.message || 'Not found.';
           appState.resultClass = 'error';
         }
         saveState();

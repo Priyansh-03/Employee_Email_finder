@@ -3,10 +3,23 @@ const lastNameInput = document.getElementById('lastName');
 const companyInput = document.getElementById('company');
 const resultDiv = document.getElementById('result');
 const loadingDiv = document.getElementById('loading');
-const loadingHeader = document.getElementById('loadingHeader');
-const progressLog = document.getElementById('progressLog');
+const animName = document.getElementById('animName');
+const animStatus = document.getElementById('animStatus');
 const btn = document.getElementById('findBtn');
 const stopBtn = document.getElementById('stopBtn');
+
+function statusFromLog(logs) {
+  if (!logs || logs.length === 0) return 'Connecting...';
+  const last = (logs[logs.length - 1].text || '').toLowerCase();
+  if (last.includes('connect')) return 'Connecting to server...';
+  if (last.includes('dns') || last.includes('mx') || last.includes('domain')) return 'Checking domain records...';
+  if (last.includes('pattern') || last.includes('generat')) return 'Generating email patterns...';
+  if (last.includes('brute') || last.includes('trying') || last.includes('attempt') || last.includes('combination')) return 'Trying email combinations...';
+  if (last.includes('verif')) return 'Verifying email addresses...';
+  if (last.includes('found') || last.includes('success')) return 'Almost there...';
+  if (last.includes('error') || last.includes('fail')) return 'Retrying with alternate methods...';
+  return 'Processing...';
+}
 
 function renderState(state) {
   if (!firstNameInput.value && state.firstName) firstNameInput.value = state.firstName;
@@ -16,11 +29,14 @@ function renderState(state) {
   if (state.status === 'loading') {
     resultDiv.style.display = 'none';
     loadingDiv.style.display = 'block';
-    loadingHeader.innerHTML = state.loadingHeader || `<strong>Finding email for:</strong><br><span style="color:#007bff; font-size:16px; font-weight:bold;">${state.firstName} ${state.lastName}</span>`;
-    
-    progressLog.innerHTML = state.logs.map(log => `<div class="${log.class}">${log.text}</div>`).join('');
-    progressLog.scrollTop = progressLog.scrollHeight; // Auto-scroll to bottom
-    
+    animName.textContent = `${state.firstName} ${state.lastName}`;
+    const newStatus = statusFromLog(state.logs);
+    if (animStatus.textContent !== newStatus) {
+      animStatus.style.animation = 'none';
+      animStatus.offsetHeight; // reflow to restart animation
+      animStatus.style.animation = '';
+      animStatus.textContent = newStatus;
+    }
     btn.style.display = 'none';
     stopBtn.style.display = 'block';
   } else if (state.status === 'done') {
@@ -91,7 +107,6 @@ btn.addEventListener('click', () => {
     firstName: firstName,
     lastName: lastName,
     company: company,
-    loadingHeader: `<strong>Finding email for:</strong><br><span style="color:#007bff; font-size:16px; font-weight:bold;">${firstName} ${lastName}</span>`,
     logs: [{ text: 'Connecting to server...', class: 'log-entry' }]
   });
 });
