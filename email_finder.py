@@ -506,6 +506,7 @@ def upsert_learned_success(slug, domain_host, pattern_key):
     with _learned_io_lock:
         store = load_learned_patterns()
         successes = normalized_successes_for_slug(store, slug)
+        failures = normalized_failures_for_slug(store, slug)
         dlow = domain_host.lower()
         updated = False
         for s in successes:
@@ -527,8 +528,91 @@ def upsert_learned_success(slug, domain_host, pattern_key):
             )
         for s in successes:
             s.pop("decay_score", None)
-        store[slug] = {"successes": successes}
+        # A confirmed success clears any prior failure record for this pair —
+        # the pattern clearly does work on this domain.
+        failures = [
+            f
+            for f in failures
+            if not (
+                (f.get("domain") or "").lower() == dlow
+                and f.get("pattern_key") == pattern_key
+            )
+        ]
+        store[slug] = {"successes": successes, "failures": failures}
         save_learned_patterns(store)
+
+
+def normalized_failures_for_slug(store, slug):
+    """Return fail_count rows for a slug: patterns that were tried and confirmed invalid."""
+    if not slug:
+        return []
+    row = store.get(slug)
+    if not isinstance(row, dict):
+        return []
+    if isinstance(row.get("failures"), list):
+        return [dict(f) for f in row["failures"] if isinstance(f, dict)]
+    return []
+
+
+# Patterns with at least this many confirmed-invalid SMTP checks for a domain
+# (and no recorded success) are skipped on future runs for that domain.
+FAILURE_SKIP_THRESHOLD = 2
+
+
+def upsert_learned_failure(slug, domain_host, pattern_key):
+    """
+    Record a confirmed-invalid (domain, pattern_key) pair so future runs stop
+    re-probing it. Mirrors upsert_learned_success but tracks fail_count.
+    """
+    if not slug or not domain_host or not pattern_key:
+        return
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _learned_io_lock:
+        store = load_learned_patterns()
+        successes = normalized_successes_for_slug(store, slug)
+        dlow = domain_host.lower()
+        # Don't record a failure for a pair we already have a success on.
+        if any(
+            (s.get("domain") or "").lower() == dlow and s.get("pattern_key") == pattern_key
+            for s in successes
+        ):
+            return
+        failures = normalized_failures_for_slug(store, slug)
+        updated = False
+        for f in failures:
+            if (f.get("domain") or "").lower() == dlow and f.get("pattern_key") == pattern_key:
+                f["fail_count"] = int(f.get("fail_count", 1)) + 1
+                f["last_seen"] = now
+                updated = True
+                break
+        if not updated:
+            failures.append(
+                {
+                    "domain": domain_host,
+                    "pattern_key": pattern_key,
+                    "last_seen": now,
+                    "fail_count": 1,
+                }
+            )
+        for s in successes:
+            s.pop("decay_score", None)
+        store[slug] = {"successes": successes, "failures": failures}
+        save_learned_patterns(store)
+
+
+def failed_pattern_keys_for_domain(slug, domain):
+    """Pattern keys that have hit FAILURE_SKIP_THRESHOLD confirmed-invalid checks on this domain."""
+    if not slug or not domain:
+        return set()
+    store = load_learned_patterns()
+    failures = normalized_failures_for_slug(store, slug)
+    dlow = domain.lower()
+    return {
+        f.get("pattern_key")
+        for f in failures
+        if (f.get("domain") or "").lower() == dlow
+        and int(f.get("fail_count", 0)) >= FAILURE_SKIP_THRESHOLD
+    }
 
 
 def infer_pattern_key(first_name, last_name, local_part, middle_name=""):
@@ -577,7 +661,8 @@ def rank_patterns_for_domain(slug, domain):
             -_iso_ts_for_sort(agg[pk]["last_seen"] or ""),
         ),
     )
-    tail = [pk for pk in PERMUTATION_PATTERN_KEYS if pk not in ordered]
+    skip = failed_pattern_keys_for_domain(slug, domain)
+    tail = [pk for pk in PERMUTATION_PATTERN_KEYS if pk not in ordered and pk not in skip]
     return ordered + tail
 
 
@@ -606,27 +691,31 @@ def observed_pattern_keys_for_domain(slug, domain):
 
 
 def ordered_local_parts_with_preferred_keys(
-    first_name, last_name, preferred_keys, middle_name=""
+    first_name, last_name, preferred_keys, middle_name="", exclude_keys=None
 ):
     """
     All permutation local-parts; those matching preferred_keys (in order) first,
-    then the rest without duplicate local-part strings.
+    then the rest without duplicate local-part strings. Patterns in exclude_keys
+    (e.g. previously confirmed-invalid for this domain) are dropped entirely.
     """
     keys = PERMUTATION_PATTERN_KEYS
     template_emails = generate_permutations(first_name, last_name, "x.com", middle_name)
     local_parts = [e.split("@")[0] for e in template_emails]
     preferred_keys = preferred_keys or []
+    exclude_keys = exclude_keys or set()
     seen_lp = set()
     ordered = []
     for pk in preferred_keys:
-        if pk not in keys:
+        if pk not in keys or pk in exclude_keys:
             continue
         lp = local_parts[keys.index(pk)]
         low = lp.lower()
         if low not in seen_lp:
             seen_lp.add(low)
             ordered.append(lp)
-    for lp in local_parts:
+    for idx, lp in enumerate(local_parts):
+        if keys[idx] in exclude_keys:
+            continue
         low = lp.lower()
         if low not in seen_lp:
             seen_lp.add(low)
@@ -902,6 +991,8 @@ def predict_emails(
         time.sleep(random.uniform(0.08, 0.28))
         ok = verify_email_smtp(email, mx, dom)
         pk = cand["signals"]["pattern"]
+        if ok is False and slug_eff:
+            upsert_learned_failure(slug_eff, dom, pk)
         row_hits = 0
         for s in successes:
             if (
@@ -1001,8 +1092,9 @@ def find_email(
                 if (use_learned_pattern_order and slug)
                 else []
             )
+            exclude_keys = failed_pattern_keys_for_domain(slug, domain) if slug else set()
             for local_part in ordered_local_parts_with_preferred_keys(
-                first_name, last_name, pref_keys, middle_name
+                first_name, last_name, pref_keys, middle_name, exclude_keys
             ):
                 email = f"{local_part}@{domain}"
                 if email.lower() in skip:
@@ -1138,6 +1230,10 @@ def find_email(
             notify("blocked")
         else:
             notify("no")
+            if slug:
+                pk = infer_pattern_key(first_name, last_name, email.split("@")[0], middle_name)
+                if pk:
+                    upsert_learned_failure(slug, domain, pk)
             time.sleep(random.uniform(0.5, 1.5))
 
     def run_batch(label, tasks):
