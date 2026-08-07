@@ -33,13 +33,22 @@ CSV_ROW_DELAY_SEC = 0.25
 
 
 def _split_display_name(name):
+    """Split a display name into (first, middle, last).
+
+    Only the first and last words are used as surname components; anything
+    in between is treated as a middle name (initial), not glued onto the
+    surname — a name like "John Michael Smith" must not become last_name
+    "Michael Smith".
+    """
     name = (name or "").strip()
     if not name:
-        return "", ""
+        return "", "", ""
     parts = name.split()
     if len(parts) == 1:
-        return parts[0], parts[0]
-    return parts[0], " ".join(parts[1:])
+        return parts[0], "", parts[0]
+    if len(parts) == 2:
+        return parts[0], "", parts[1]
+    return parts[0], " ".join(parts[1:-1]), parts[-1]
 
 
 def _norm_header(h):
@@ -113,13 +122,14 @@ def _short_reason(signals, confidence):
     return "; ".join(parts[:3])
 
 
-def _predict_row(first_name, last_name, company, mx_cache, smtp_pacer):
+def _predict_row(first_name, last_name, company, mx_cache, smtp_pacer, middle_name=""):
     target_domains, domain_sources, company_slug = _build_predict_inputs(company)
     silent = lambda *args, **kwargs: None
     return predict_emails(
         first_name,
         last_name,
         target_domains,
+        middle_name=middle_name,
         company_slug=company_slug,
         domain_sources=domain_sources,
         progress_callback=silent,
@@ -244,7 +254,7 @@ def upload_csv():
     smtp_pacer = DomainSmtpPacer(min_interval=0.4)
     out_rows = []
     for display_name, company in rows_in:
-        first, last = _split_display_name(display_name)
+        first, middle, last = _split_display_name(display_name)
         if not company:
             out_rows.append(
                 {
@@ -275,7 +285,7 @@ def upload_csv():
             continue
 
         try:
-            pred = _predict_row(first, last, company, mx_cache, smtp_pacer)
+            pred = _predict_row(first, last, company, mx_cache, smtp_pacer, middle_name=middle)
             out_rows.append(_row_to_output(display_name, company, pred))
         except Exception as ex:
             out_rows.append(
@@ -320,18 +330,23 @@ def api_find_email():
     data = request.json
     first_name = data.get('first_name')
     last_name = data.get('last_name')
+    middle_name = data.get('middle_name', '')
     company = data.get('company')
-    
+
     if not all([first_name, last_name, company]):
         return jsonify({"success": False, "message": "Missing required fields"}), 400
-        
-    print(f"\nRequest: {first_name} {last_name} at {company}")
+
+    print(f"\nRequest: {first_name} {middle_name} {last_name} at {company}".replace("  ", " "))
 
     def api_progress(msg, _current_email=None):
         print(msg)
 
     email = two_pass_find_email(
-        first_name, last_name, company, progress_callback=api_progress
+        first_name,
+        last_name,
+        company,
+        progress_callback=api_progress,
+        middle_name=middle_name,
     )
     
     if email:
@@ -351,6 +366,7 @@ def api_predict_emails():
     data = request.json or {}
     first_name = data.get("first_name")
     last_name = data.get("last_name")
+    middle_name = data.get("middle_name", "")
     company = data.get("company")
     if not all([first_name, last_name, company]):
         return jsonify({"success": False, "message": "Missing required fields"}), 400
@@ -387,6 +403,7 @@ def api_predict_emails():
         first_name,
         last_name,
         target_domains,
+        middle_name=middle_name,
         company_slug=company_slug,
         domain_sources=domain_sources,
         confidence_threshold=conf_th,
@@ -410,6 +427,7 @@ def stop_search():
 def stream_find_email():
     first_name = request.args.get('first_name')
     last_name = request.args.get('last_name')
+    middle_name = request.args.get('middle_name', '')
     company = request.args.get('company')
     session_id = request.args.get('session_id')
     
@@ -435,6 +453,7 @@ def stream_find_email():
                     company,
                     progress_callback,
                     cancel_event,
+                    middle_name=middle_name,
                 )
                 
                 if cancel_event.is_set():

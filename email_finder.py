@@ -38,6 +38,9 @@ PERMUTATION_PATTERN_KEYS = (
     "last_dot_f_initial",
     "l_initial_first",
     "l_dot_first",
+    "first_dot_m_dot_last",
+    "first_m_last",
+    "f_m_last",
 )
 
 _learned_io_lock = threading.Lock()
@@ -229,14 +232,20 @@ def verify_email_smtp(email, mx_record, domain, is_catch_all_check=False):
             print(f"  Mail check error for {email}: {e}")
         return None
 
-def generate_permutations(first_name, last_name, domain):
-    """Generate comprehensive email format permutations (expanded from 12 to 18)."""
+def generate_permutations(first_name, last_name, domain, middle_name=""):
+    """Generate comprehensive email format permutations (expanded from 18 to 21).
+
+    Always returns 21 entries in lockstep with PERMUTATION_PATTERN_KEYS, even
+    when no middle name is given, so pattern indices stay stable regardless
+    of whether the person has a middle name.
+    """
     first = first_name.lower()
     last = last_name.lower()
     f = first[0]
     l = last[0]
-    
-    return [
+    middle = (middle_name or "").strip().lower()
+
+    perms = [
         f"{first}.{last}@{domain}",
         f"{first}{last}@{domain}",
         f"{first}_{last}@{domain}",
@@ -254,8 +263,26 @@ def generate_permutations(first_name, last_name, domain):
         f"{last}{f}@{domain}",
         f"{last}.{f}@{domain}",
         f"{l}{first}@{domain}",
-        f"{l}.{first}@{domain}"
+        f"{l}.{first}@{domain}",
     ]
+
+    if middle:
+        m = middle[0]
+        perms += [
+            f"{first}.{m}.{last}@{domain}",
+            f"{first}{m}{last}@{domain}",
+            f"{f}{m}{l}@{domain}",
+        ]
+    else:
+        # Keep the list length constant (harmless duplicates of earlier entries)
+        # so pattern-key indices remain valid whether or not a middle name exists.
+        perms += [
+            f"{first}.{last}@{domain}",
+            f"{first}{last}@{domain}",
+            f"{f}{last}@{domain}",
+        ]
+
+    return perms
 
 def generate_domain_variations(domains):
     """Generate common TLD variations for a given list of domains."""
@@ -504,12 +531,14 @@ def upsert_learned_success(slug, domain_host, pattern_key):
         save_learned_patterns(store)
 
 
-def infer_pattern_key(first_name, last_name, local_part):
+def infer_pattern_key(first_name, last_name, local_part, middle_name=""):
     if not local_part:
         return None
     target = local_part.strip().lower()
     keys = PERMUTATION_PATTERN_KEYS
-    for key, email in zip(keys, generate_permutations(first_name, last_name, "x.com")):
+    for key, email in zip(
+        keys, generate_permutations(first_name, last_name, "x.com", middle_name)
+    ):
         if email.split("@")[0].lower() == target:
             return key
     return None
@@ -576,13 +605,15 @@ def observed_pattern_keys_for_domain(slug, domain):
     return out
 
 
-def ordered_local_parts_with_preferred_keys(first_name, last_name, preferred_keys):
+def ordered_local_parts_with_preferred_keys(
+    first_name, last_name, preferred_keys, middle_name=""
+):
     """
     All permutation local-parts; those matching preferred_keys (in order) first,
     then the rest without duplicate local-part strings.
     """
     keys = PERMUTATION_PATTERN_KEYS
-    template_emails = generate_permutations(first_name, last_name, "x.com")
+    template_emails = generate_permutations(first_name, last_name, "x.com", middle_name)
     local_parts = [e.split("@")[0] for e in template_emails]
     preferred_keys = preferred_keys or []
     seen_lp = set()
@@ -603,12 +634,12 @@ def ordered_local_parts_with_preferred_keys(first_name, last_name, preferred_key
     return ordered
 
 
-def local_part_for_pattern_key(first_name, last_name, pattern_key):
+def local_part_for_pattern_key(first_name, last_name, pattern_key, middle_name=""):
     keys = PERMUTATION_PATTERN_KEYS
     if not pattern_key or pattern_key not in keys:
         return None
     idx = keys.index(pattern_key)
-    email = generate_permutations(first_name, last_name, "x.com")[idx]
+    email = generate_permutations(first_name, last_name, "x.com", middle_name)[idx]
     return email.split("@")[0]
 
 
@@ -724,6 +755,7 @@ def predict_emails(
     first_name,
     last_name,
     domains,
+    middle_name="",
     company_slug=None,
     domain_sources=None,
     progress_callback=None,
@@ -794,7 +826,7 @@ def predict_emails(
         dlow = domain.lower()
         pats = rank_patterns_for_domain(slug_eff, domain)[:top_patterns_per_domain]
         for pk in pats:
-            lp = local_part_for_pattern_key(first_name, last_name, pk)
+            lp = local_part_for_pattern_key(first_name, last_name, pk, middle_name)
             if not lp:
                 continue
             email = f"{lp}@{domain}"
@@ -922,6 +954,7 @@ def find_email(
     company_slug=None,
     mx_cache=None,
     smtp_pacer=None,
+    middle_name="",
 ):
     """Main function to find the valid email across multiple domains with safe parallelism."""
     
@@ -969,7 +1002,7 @@ def find_email(
                 else []
             )
             for local_part in ordered_local_parts_with_preferred_keys(
-                first_name, last_name, pref_keys
+                first_name, last_name, pref_keys, middle_name
             ):
                 email = f"{local_part}@{domain}"
                 if email.lower() in skip:
@@ -991,7 +1024,7 @@ def find_email(
             domain_shoot_order = list(valid_domains)
         for domain in domain_shoot_order:
             for pk in rank_patterns_for_domain(slug, domain)[:3]:
-                lp = local_part_for_pattern_key(first_name, last_name, pk)
+                lp = local_part_for_pattern_key(first_name, last_name, pk, middle_name)
                 if not lp:
                     continue
                 em = f"{lp}@{domain}"
@@ -1135,7 +1168,7 @@ def find_email(
     if found_email and slug:
         lp = found_email.split("@")[0]
         dom = found_email.split("@")[1]
-        pk = infer_pattern_key(first_name, last_name, lp)
+        pk = infer_pattern_key(first_name, last_name, lp, middle_name)
         if pk:
             upsert_learned_success(slug, dom, pk)
 
@@ -1159,6 +1192,7 @@ def two_pass_find_email(
     progress_callback=None,
     cancel_event=None,
     pass2_empty_resolver=None,
+    middle_name="",
 ):
     """
     Pass 1: if learned_patterns matches the company, search using TLD variations
@@ -1204,6 +1238,7 @@ def two_pass_find_email(
             first_name,
             last_name,
             pass1_domains,
+            middle_name=middle_name,
             company_slug=learned_slug,
             domain_sources=src_map,
             progress_callback=progress_callback,
@@ -1215,7 +1250,7 @@ def two_pass_find_email(
         if verified:
             lp = verified.split("@")[0]
             dom = verified.split("@")[1]
-            pk = infer_pattern_key(first_name, last_name, lp)
+            pk = infer_pattern_key(first_name, last_name, lp, middle_name)
             if pk and learned_slug:
                 upsert_learned_success(learned_slug, dom, pk)
             return verified
@@ -1269,6 +1304,7 @@ def two_pass_find_email(
         company_slug=company_slug,
         mx_cache=mx_session,
         smtp_pacer=smtp_pacer,
+        middle_name=middle_name,
     )
 
 
